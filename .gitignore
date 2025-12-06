@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Virtualenv / environment
+venv/
+ENV/
+env/
+pyvenv.cfg
+
+# VSCode
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Jupyter
+.ipynb_checkpoints
+
+# Model / data (don't commit large model files)
+*.bin
+*.safetensors
+*.pt
+/models/
+data/
+results/
+.cache/
+.cache_huggingface/
+
+# Optional: keep requirements and small example data
+!requirements.txt
+!data/dev/*.json
+
+# Git LFS placeholder (if you use LFS, declare paths here too)
+# *.safetensors

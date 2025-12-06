@@ -1,0 +1,26 @@
+fastapi
+uvicorn[standard]
+
+transformers
+torch
+sentencepiece
+
+# reranker
+sentence-transformers
+
+# HTML parsing + extraction
+beautifulsoup4
+lxml
+
+# optional extractors (not required but supported)
+boilerpy3
+readability-lxml
+newspaper3k
+
+# NLP utilities
+spacy
+nltk
+
+# UI (optional)
+streamlit
+requests
