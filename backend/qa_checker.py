@@ -141,34 +141,57 @@ def _in_context(entity: str, context: str) -> bool:
         return False
     return entity.lower() in context.lower()
 
-def _qa_check(entity_text: str, context: str, min_score: float = 0.25) -> Dict[str, Any]:
+def _qa_check(entity_text: str, context: str, min_score: float = 0.25, top_k: int = 1) -> Dict[str, Any]:
     """
     Run QA pipeline to see if `entity_text` is supported by `context`.
-    Returns dict: {"supported": bool, "answer": str, "score": float, "error": Optional[str]}
+    Returns dict: {"supported": bool, "answer": str, "score": float, "error": Optional[str], "raw": Any}
     """
     if not entity_text or not context:
-        return {"supported": False, "answer": "", "score": 0.0, "error": "no_input"}
+        return {"supported": False, "answer": "", "score": 0.0, "error": "no_input", "raw": None}
 
     if _qa_pipe is None:
-        return {"supported": False, "answer": "", "score": 0.0, "error": "qa_pipeline_unavailable"}
+        return {"supported": False, "answer": "", "score": 0.0, "error": "qa_pipeline_unavailable", "raw": None}
 
-    # trim context to manageable size (characters), prefer keeping beginning which often contains key facts
-    max_ctx_chars = 3000
+    # --- simple question templating (helps QA models find answers) ---
+    q = entity_text
+    # If entity is short (likely a NAME / DATE / ORG), convert to a short question
+    # you can expand label-based templates if you have the label available
+    words = entity_text.split()
+    if len(words) <= 3:
+        # basic templates — tweak as needed
+        if any(ch.isdigit() for ch in entity_text):
+            q = f"When did {entity_text} happen?"
+        else:
+            q = f"What is {entity_text}?"
+    
+    # --- context trimming: prefer a paragraph containing the entity if possible ---
+    max_ctx_chars = 8000  # larger so we don't accidentally cut evidence
     context_snippet = context if len(context) <= max_ctx_chars else context[:max_ctx_chars]
 
     try:
-        resp = _qa_pipe(question=entity_text, context=context_snippet, top_k=1)
-        # HF returns dict or list depending on top_k
-        best = resp[0] if isinstance(resp, list) and resp else resp
-        if not isinstance(best, dict):
-            return {"supported": False, "answer": "", "score": 0.0, "error": "unexpected_qa_response"}
-        answer = best.get("answer", "").strip()
-        score = float(best.get("score", 0.0))
+        resp = _qa_pipe(question=q, context=context_snippet, top_k=top_k)
+        # DEBUG: keep raw response for troubleshooting (logs)
+        logger.info(f"QA raw response for q='{q[:80]}' entity='{entity_text[:80]}': {resp}")
+
+        # normalize response into a single best dict
+        best = None
+        if isinstance(resp, list):
+            best = resp[0] if resp else {"answer": "", "score": 0.0}
+        elif isinstance(resp, dict):
+            best = resp
+        else:
+            # unexpected return type
+            return {"supported": False, "answer": "", "score": 0.0, "error": "unexpected_qa_response_type", "raw": resp}
+
+        answer = best.get("answer", "").strip() if isinstance(best, dict) else ""
+        score = float(best.get("score", 0.0)) if isinstance(best, dict) else 0.0
         supported = bool(answer) and score >= min_score
-        return {"supported": supported, "answer": answer, "score": score}
+
+        return {"supported": supported, "answer": answer, "score": score, "error": None, "raw": resp}
     except Exception as e:
-        logger.warning(f"QA pipeline failed for entity '{entity_text}': {e}")
-        return {"supported": False, "answer": "", "score": 0.0, "error": str(e)}
+        logger.warning(f"QA pipeline failed for q='{q}' entity='{entity_text}': {e}")
+        return {"supported": False, "answer": "", "score": 0.0, "error": str(e), "raw": None}
+
 
 # -------- Main check function --------
 def check_summary_against_source(summary: str, source: str, max_entities_per_sentence: int = 5) -> Dict[str, Any]:
