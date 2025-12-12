@@ -43,6 +43,30 @@ api_url = st.sidebar.text_input("API URL", API_URL_DEFAULT)
 if api_url.endswith("/"):
     api_url = api_url[:-1]
 
+st.sidebar.subheader("Model Selection")
+model_options = {
+    "DistilBART (fast, dev)": "sshleifer/distilbart-cnn-12-6",
+    "BART Large (best quality)": "facebook/bart-large-cnn",
+    "T5 Base": "google/flan-t5-base",
+    "PEGASUS": "google/pegasus-cnn_dailymail"
+}
+selected_model = st.sidebar.selectbox("Summarization Model", list(model_options.keys()), index=0)
+model_name = model_options[selected_model]
+
+st.sidebar.subheader("Summarization Method")
+method_choice = st.sidebar.radio(
+    "Method",
+    ["Abstractive (Transformer)", "Extractive (TF-IDF)", "Extractive (TextRank)", "Extractive (Lead)"]
+)
+
+extractive_method = None
+if "TF-IDF" in method_choice:
+    extractive_method = "tfidf"
+elif "TextRank" in method_choice:
+    extractive_method = "textrank"
+elif "Lead" in method_choice:
+    extractive_method = "lead"
+
 st.sidebar.subheader("Generation")
 min_len = st.sidebar.slider("min_length", 10, 120, 40)
 max_len = st.sidebar.slider("max_length", 40, 400, 160)
@@ -91,8 +115,10 @@ with col1:
         payload = {
             "text": article_input,
             "input_is_html": False,
-            "min_length": min_len,
-            "max_length": max_len,
+            "model_name": model_name,
+            "extractive_method": extractive_method,
+            "min_length": min_len if not extractive_method else None,
+            "max_length": max_len if not extractive_method else None,
             "num_beams": beams,
             "length_penalty": length_penalty,
             "no_repeat_ngram_size": no_repeat_ngram,

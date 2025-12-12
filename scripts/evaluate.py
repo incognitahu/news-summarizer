@@ -1,22 +1,38 @@
 # scripts/evaluate.py
 """
-Evaluation harness for the News Summarizer project.
+Batch evaluation script for news summarization models.
+
+Evaluates multiple models and methods on the BBC News Summary dataset:
+- Abstractive: BART, T5, PEGASUS
+- Extractive: TF-IDF, TextRank, Lead
+
+Metrics: ROUGE-1, ROUGE-2, ROUGE-L, BLEU
 
 Modes:
 - "local" : import and call summarizer functions/classes directly (fast, requires Python imports)
 - "api"   : call the running FastAPI endpoint at http://127.0.0.1:8000/summarize
 
 Outputs:
-- results/eval_results.json (per-article metrics + aggregates)
-- prints a short summary to stdout
+- evaluation_results.json (per-model metrics + comparison table)
+- prints a comparison summary to stdout
 """
 
 import os
 import json
 import glob
+import sys
 import time
-from typing import Dict, Any, List
+from pathlib import Path
+from typing import Dict, Any, List, Tuple
 from tqdm import tqdm
+
+# Add parent directory to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from backend.summarizer import NewsSummarizer
+from backend.extractive import extractive_tfidf, extractive_textrank, extractive_lead
+from backend.metrics import evaluate_summary
+from backend.preprocess import preprocess_for_model
 
 # choose mode: "api" or "local"
 MODE = os.environ.get("EVAL_MODE", "api")  # export EVAL_MODE=local to use local mode
@@ -74,39 +90,226 @@ except Exception:
 # rouge scorer
 scorer = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
 
-def compute_rouge(reference: str, predicted: str) -> Dict[str, float]:
-    scores = scorer.score(reference, predicted)
-    return {
-        "rouge1": scores["rouge1"].fmeasure,
-        "rouge2": scores["rouge2"].fmeasure,
-        "rougeL": scores["rougeL"].fmeasure,
-    }
-
-def compute_bertscore(cands: List[str], refs: List[str], model_type="microsoft/deberta-xlarge-mnli"):
-    # return precision, recall, f1 arrays
-    P, R, F = bertscore_score(cands, refs, lang="en", rescale_with_baseline=True)
-    # convert tensors to floats
-    return [float(x) for x in P], [float(x) for x in R], [float(x) for x in F]
-
-def compute_factuality_flags(summary: str, source: str) -> Dict[str, Any]:
+def load_bbc_dataset(dataset_path: str) -> List[Tuple[str, str, str]]:
     """
-    Use qa_checker.check_summary_against_source if available.
+    Load BBC News Summary dataset.
+    
     Returns:
-      {
-        "overall_flagged_entities": int,
-        "num_entities": int,
-        "frac_flagged_entities": float,
-        "article_flagged": bool
-      }
+        List of (category, article_text, reference_summary) tuples
     """
-    if not QA_AVAILABLE:
-        return {"overall_flagged_entities": None, "num_entities": None, "frac_flagged_entities": None, "article_flagged": None}
+    dataset = []
+    categories = ["business", "entertainment", "politics", "sport", "tech"]
+    
+    for category in categories:
+        articles_dir = Path(dataset_path) / "Summaries" / category
+        if not articles_dir.exists():
+            print(f"Warning: {articles_dir} not found, skipping {category}")
+            continue
+        
+        # Get all article files
+        article_files = sorted(articles_dir.glob("*.txt"))
+        
+        for article_file in article_files:
+            try:
+                with open(article_file, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read().strip()
+                
+                # BBC dataset format: first paragraph is summary, rest is article
+                parts = content.split('\n\n', 1)
+                if len(parts) == 2:
+                    reference_summary = parts[0].strip()
+                    article_text = parts[1].strip()
+                    
+                    if article_text and reference_summary:
+                        dataset.append((category, article_text, reference_summary))
+            except Exception as e:
+                print(f"Error loading {article_file}: {e}")
+    
+    return dataset
 
-    res = check_summary_against_source(summary, source)
-    total = 0
-    flagged = 0
-    for s in res.get("sentence_checks", []):
-        for e in s.get("entities", []):
+
+def evaluate_model(model_name: str, dataset: List[Tuple[str, str, str]], 
+                   max_samples: int = None) -> Dict[str, float]:
+    """
+    Evaluate an abstractive model on the dataset.
+    
+    Args:
+        model_name: HuggingFace model name
+        dataset: List of (category, article, reference) tuples
+        max_samples: Maximum number of samples to evaluate (None = all)
+    
+    Returns:
+        Dictionary with average metrics
+    """
+    print(f"\nEvaluating {model_name}...")
+    summarizer = NewsSummarizer(model_name=model_name, device=-1)  # CPU for stability
+    
+    all_metrics = []
+    samples = dataset[:max_samples] if max_samples else dataset
+    
+    for i, (category, article, reference) in enumerate(tqdm(samples, desc=model_name)):
+        try:
+            # Preprocess and summarize
+            cleaned_text, _ = preprocess_for_model(article, input_is_html=False)
+            summary = summarizer.summarize(cleaned_text)
+            
+            # Evaluate
+            metrics = evaluate_summary(summary, reference, include_bertscore=False)
+            all_metrics.append(metrics)
+            
+        except Exception as e:
+            print(f"\nError on sample {i}: {e}")
+            continue
+    
+    # Average metrics
+    if not all_metrics:
+        return {}
+    
+    avg_metrics = {}
+    for key in all_metrics[0].keys():
+        avg_metrics[key] = sum(m[key] for m in all_metrics) / len(all_metrics)
+    
+    return avg_metrics
+
+
+def evaluate_extractive(method: str, dataset: List[Tuple[str, str, str]], 
+                        max_samples: int = None) -> Dict[str, float]:
+    """
+    Evaluate an extractive method on the dataset.
+    
+    Args:
+        method: "tfidf", "textrank", or "lead"
+        dataset: List of (category, article, reference) tuples
+        max_samples: Maximum number of samples to evaluate (None = all)
+    
+    Returns:
+        Dictionary with average metrics
+    """
+    print(f"\nEvaluating extractive-{method}...")
+    
+    method_funcs = {
+        "tfidf": extractive_tfidf,
+        "textrank": extractive_textrank,
+        "lead": extractive_lead
+    }
+    
+    func = method_funcs[method]
+    all_metrics = []
+    samples = dataset[:max_samples] if max_samples else dataset
+    
+    for i, (category, article, reference) in enumerate(tqdm(samples, desc=f"extractive-{method}")):
+        try:
+            # Preprocess and summarize
+            cleaned_text, _ = preprocess_for_model(article, input_is_html=False)
+            summary = func(cleaned_text, num_sentences=3)
+            
+            # Evaluate
+            metrics = evaluate_summary(summary, reference, include_bertscore=False)
+            all_metrics.append(metrics)
+            
+        except Exception as e:
+            print(f"\nError on sample {i}: {e}")
+            continue
+    
+    # Average metrics
+    if not all_metrics:
+        return {}
+    
+    avg_metrics = {}
+    for key in all_metrics[0].keys():
+        avg_metrics[key] = sum(m[key] for m in all_metrics) / len(all_metrics)
+    
+    return avg_metrics
+
+
+def main():
+    # Configuration
+    dataset_path = r"D:\Code\GitHub\SmartNewsSumm\BBC News Summary"
+    max_samples = 100  # Set to None to evaluate entire dataset (slower)
+    
+    # Models to evaluate
+    abstractive_models = [
+        "sshleifer/distilbart-cnn-12-6",
+        "facebook/bart-large-cnn",
+        # "google/flan-t5-base",  # Uncomment to include T5
+        # "google/pegasus-cnn_dailymail",  # Uncomment to include PEGASUS
+    ]
+    
+    extractive_methods = ["tfidf", "textrank", "lead"]
+    
+    # Load dataset
+    print("Loading BBC News Summary dataset...")
+    dataset = load_bbc_dataset(dataset_path)
+    print(f"Loaded {len(dataset)} articles")
+    
+    if not dataset:
+        print("Error: No articles loaded. Check dataset path.")
+        return
+    
+    # Results storage
+    results = {}
+    
+    # Evaluate abstractive models
+    for model_name in abstractive_models:
+        try:
+            start_time = time.time()
+            metrics = evaluate_model(model_name, dataset, max_samples)
+            elapsed = time.time() - start_time
+            
+            results[model_name] = metrics
+            results[model_name]["time"] = elapsed
+            
+            print(f"{model_name}:")
+            for key, value in metrics.items():
+                print(f"  {key}: {value:.4f}")
+            print(f"  Time: {elapsed:.2f}s")
+        except Exception as e:
+            print(f"Failed to evaluate {model_name}: {e}")
+    
+    # Evaluate extractive methods
+    for method in extractive_methods:
+        try:
+            start_time = time.time()
+            metrics = evaluate_extractive(method, dataset, max_samples)
+            elapsed = time.time() - start_time
+            
+            method_key = f"extractive-{method}"
+            results[method_key] = metrics
+            results[method_key]["time"] = elapsed
+            
+            print(f"{method_key}:")
+            for key, value in metrics.items():
+                print(f"  {key}: {value:.4f}")
+            print(f"  Time: {elapsed:.2f}s")
+        except Exception as e:
+            print(f"Failed to evaluate {method}: {e}")
+    
+    # Print comparison table
+    print("\n" + "="*80)
+    print("COMPARISON TABLE")
+    print("="*80)
+    print(f"{'Model':<35} {'ROUGE-1':<10} {'ROUGE-2':<10} {'ROUGE-L':<10} {'BLEU':<10} {'Time(s)':<10}")
+    print("-"*80)
+    
+    for model, metrics in results.items():
+        rouge1 = metrics.get("rouge1", 0.0)
+        rouge2 = metrics.get("rouge2", 0.0)
+        rougeL = metrics.get("rougeL", 0.0)
+        bleu = metrics.get("bleu", 0.0)
+        elapsed = metrics.get("time", 0.0)
+        
+        print(f"{model:<35} {rouge1:<10.4f} {rouge2:<10.4f} {rougeL:<10.4f} {bleu:<10.4f} {elapsed:<10.2f}")
+    
+    # Save results to JSON
+    output_file = "evaluation_results.json"
+    with open(output_file, 'w') as f:
+        json.dump(results, f, indent=2)
+    print(f"\nResults saved to {output_file}")
+
+
+if __name__ == "__main__":
+    main()
+
             total += 1
             if e.get("flagged"):
                 flagged += 1

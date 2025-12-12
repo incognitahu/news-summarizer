@@ -21,6 +21,16 @@ newspaper3k
 spacy
 nltk
 
+# Evaluation metrics
+rouge-score
+bert-score
+scikit-learn
+networkx
+
+# PDF parsing
+PyPDF2
+
 # UI (optional)
 streamlit
 requests
+tqdm

@@ -51,9 +51,33 @@ logger.setLevel(logging.INFO)
 
 
 class NewsSummarizer:
+    # Supported models with optimized configurations
+    MODEL_CONFIGS = {
+        "facebook/bart-large-cnn": {
+            "max_length": 142,
+            "min_length": 56,
+            "length_penalty": 2.0,
+        },
+        "sshleifer/distilbart-cnn-12-6": {
+            "max_length": 142,
+            "min_length": 56,
+            "length_penalty": 2.0,
+        },
+        "google/flan-t5-base": {
+            "max_length": 150,
+            "min_length": 50,
+            "length_penalty": 1.0,
+        },
+        "google/pegasus-cnn_dailymail": {
+            "max_length": 128,
+            "min_length": 64,
+            "length_penalty": 0.8,
+        }
+    }
+    
     def __init__(
         self,
-        model_name: str = "facebook/bart-large-cnn",
+        model_name: str = "sshleifer/distilbart-cnn-12-6",
         device: Optional[int] = None,
         max_input_tokens: int = 1024,
         chunk_overlap_sentences: int = 2,
@@ -111,10 +135,10 @@ class NewsSummarizer:
     def summarize(
         self,
         text: str,
-        min_length: int = 40,
-        max_length: int = 160,
+        min_length: int = None,
+        max_length: int = None,
         num_beams: int = 4,
-        length_penalty: float = 1.0,
+        length_penalty: float = None,
         no_repeat_ngram_size: int = 3,
         early_stopping: bool = True,
         extractive_prefilter: str = "none",
@@ -124,8 +148,9 @@ class NewsSummarizer:
 
         Args:
             text: raw article text or cleaned HTML.
-            min_length/max_length: generation length bounds (tokens).
+            min_length/max_length: generation length bounds (tokens). Uses model defaults if None.
             num_beams: beam size for beam search generation.
+            length_penalty: length penalty for generation. Uses model defaults if None.
             extractive_prefilter: 'none' | 'lead' (first-K sentences). Hook to add more extractors later.
 
         Returns:
@@ -133,6 +158,15 @@ class NewsSummarizer:
         """
         if not text or not text.strip():
             return ""
+        
+        # Get model-specific config defaults if not provided
+        model_config = self.MODEL_CONFIGS.get(self.model_name, {})
+        if min_length is None:
+            min_length = model_config.get("min_length", 40)
+        if max_length is None:
+            max_length = model_config.get("max_length", 160)
+        if length_penalty is None:
+            length_penalty = model_config.get("length_penalty", 1.0)
 
         sentences = self._split_into_sentences(text)
         if extractive_prefilter == "lead":
