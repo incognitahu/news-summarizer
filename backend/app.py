@@ -48,15 +48,17 @@ app.add_middleware(
 class SummarizeRequest(BaseModel):
     text: str = Field(..., description="Raw article text or HTML")
     input_is_html: bool = Field(True, description="If true, run HTML extraction")
-    min_length: int = Field(40, description="Minimum tokens in summary")
-    max_length: int = Field(160, description="Maximum tokens in summary")
+    model_name: str = Field("sshleifer/distilbart-cnn-12-6", description="Model to use for summarization")
+    min_length: int = Field(None, description="Minimum tokens in summary (None = use model defaults)")
+    max_length: int = Field(None, description="Maximum tokens in summary (None = use model defaults)")
     num_beams: int = Field(4, description="Beam search width")
-    length_penalty: float = Field(1.0, description="Length penalty during generation")
+    length_penalty: float = Field(None, description="Length penalty during generation (None = use model defaults)")
     no_repeat_ngram_size: int = Field(3, description="No repeat ngram size")
     use_reranker: bool = Field(True, description="Use SBERT reranker when input is long")
     top_k: int = Field(5, description="Top-k chunk summaries to keep for fusion when reranking")
     extractive_prefilter: str = Field("none", description="none | lead (simple first-N sentences)")
     run_qa: bool = Field(True, description="Whether to run QA factuality checks (set false to skip QA)")
+    extractive_method: str = Field(None, description="Use extractive summarization: tfidf | textrank | lead")
 
 
 class EntityCheck(BaseModel):
@@ -135,7 +137,7 @@ def summarize_pipeline(
 
     # 1) Preprocess input (HTML extraction, cleaning)
     cleaned_text, sentences = preprocess_for_model(raw_input, input_is_html=input_is_html, return_sentences=True)
-    if not cleaned_text or len(cleaned_text.strip()) < 20:
+    if not cleaned_text or len(cleaned_text.strip()) < 5:
         raise ValueError("Input too short after preprocessing.")
 
     # 2) Token estimate & choose path
@@ -244,19 +246,41 @@ def api_summarize(req: SummarizeRequest):
     """
     try:
         start = time.time()
-        result = summarize_pipeline(
-            raw_input=req.text,
-            input_is_html=req.input_is_html,
-            min_length=req.min_length,
-            max_length=req.max_length,
-            num_beams=req.num_beams,
-            length_penalty=req.length_penalty,
-            no_repeat_ngram_size=req.no_repeat_ngram_size,
-            extractive_prefilter=req.extractive_prefilter,
-            use_reranker=req.use_reranker,
-            top_k=req.top_k,
-            run_qa=req.run_qa,
-        )
+        
+        # Handle extractive methods
+        if req.extractive_method:
+            from .extractive import extractive_tfidf, extractive_textrank, extractive_lead
+            cleaned_text, _ = preprocess_for_model(req.text, input_is_html=req.input_is_html)
+            if req.extractive_method == "tfidf":
+                summary = extractive_tfidf(cleaned_text, num_sentences=3)
+            elif req.extractive_method == "textrank":
+                summary = extractive_textrank(cleaned_text, num_sentences=3)
+            elif req.extractive_method == "lead":
+                summary = extractive_lead(cleaned_text, num_sentences=3)
+            else:
+                raise ValueError(f"Unknown extractive method: {req.extractive_method}")
+            
+            result = {"summary": summary, "qa_report": None, "debug": {"method": "extractive"}}
+        else:
+            # Load or reload summarizer if model changed
+            global summarizer
+            if summarizer is None or summarizer.model_name != req.model_name:
+                logger.info(f"Loading/switching to model: {req.model_name}")
+                summarizer = NewsSummarizer(model_name=req.model_name)
+            
+            result = summarize_pipeline(
+                raw_input=req.text,
+                input_is_html=req.input_is_html,
+                min_length=req.min_length,
+                max_length=req.max_length,
+                num_beams=req.num_beams,
+                length_penalty=req.length_penalty,
+                no_repeat_ngram_size=req.no_repeat_ngram_size,
+                extractive_prefilter=req.extractive_prefilter,
+                use_reranker=req.use_reranker,
+                top_k=req.top_k,
+                run_qa=req.run_qa,
+            )
 
         elapsed = time.time() - start
         logger.info(f"Summarization completed in {elapsed:.2f}s (tokens~{result['debug'].get('token_count')}).")

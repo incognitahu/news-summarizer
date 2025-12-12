@@ -142,11 +142,11 @@ def remove_boilerplate_candidates(html: str, keep_selectors: Optional[List[str]]
     return str(soup)
 
 
-def _bs_extract_main_text(html: str, min_para_words: int = 5) -> str:
+def _bs_extract_main_text(html: str, min_para_words: int = 3) -> str:
     """
     BeautifulSoup heuristic for extracting main article text:
       - keep <article> if present, otherwise select big <p> blocks
-      - filter out very short paragraphs
+      - filter out very short paragraphs (but keep if total content is small)
       - join paragraphs preserving sentence boundaries
     """
     soup = BeautifulSoup(html, "lxml")
@@ -155,17 +155,26 @@ def _bs_extract_main_text(html: str, min_para_words: int = 5) -> str:
     article_tag = soup.find("article")
     if article_tag and article_tag.get_text(strip=True):
         paras = [p.get_text(" ", strip=True) for p in article_tag.find_all(["p", "div"]) if p.get_text(strip=True)]
-        paras = [p for p in paras if len(p.split()) >= min_para_words]
-        if paras:
-            return "\n\n".join(paras)
+        # If we have short paras but combined they're substantial, keep all
+        total_words = sum(len(p.split()) for p in paras)
+        if total_words >= min_para_words:
+            # Filter individual paras only if we have enough total content
+            if total_words > 20:
+                paras = [p for p in paras if len(p.split()) >= min_para_words]
+            if paras:
+                return "\n\n".join(paras)
 
     # Otherwise, collect <p> tags across the document
     p_tags = soup.find_all("p")
     paras = [p.get_text(" ", strip=True) for p in p_tags if p.get_text(strip=True)]
-    paras = [p for p in paras if len(p.split()) >= min_para_words]
-
-    if paras:
-        return "\n\n".join(paras)
+    
+    # Smart filtering: if total is small, keep everything; otherwise filter short paras
+    total_words = sum(len(p.split()) for p in paras)
+    if total_words >= min_para_words:
+        if total_words > 20:  # Enough content to be selective
+            paras = [p for p in paras if len(p.split()) >= min_para_words]
+        if paras:
+            return "\n\n".join(paras)
 
     # Fallback: take longest text blocks from divs
     div_texts = [d.get_text(" ", strip=True) for d in soup.find_all("div") if d.get_text(strip=True)]
@@ -299,18 +308,60 @@ def split_into_sentences(text: str) -> List[str]:
 
 
 # -----------------------
+# Helper: HTML detection
+# -----------------------
+def is_likely_full_html(text: str) -> bool:
+    """
+    Detect if input is likely a full HTML document vs plain text with occasional tags.
+    Returns True if it looks like real HTML structure.
+    """
+    if not text:
+        return False
+    
+    text_lower = text.lower().strip()
+    
+    # Strong indicators of full HTML
+    html_indicators = ['<html', '<body', '<head', '<!doctype', '<article', '<div']
+    strong_match = any(indicator in text_lower for indicator in html_indicators)
+    
+    # Count total tag occurrences
+    tag_count = len(re.findall(r'<[^>]+>', text))
+    
+    # If has strong HTML structure indicators, definitely HTML
+    if strong_match:
+        return True
+    
+    # If has many tags (>5), likely HTML
+    if tag_count > 5:
+        return True
+    
+    # If has few tags (<= 3) and doesn't start/end with tags, likely plain text
+    if tag_count <= 3:
+        return False
+    
+    # Otherwise, use tag density heuristic
+    text_without_tags = re.sub(r'<[^>]+>', '', text).strip()
+    if len(text_without_tags) == 0:
+        return True  # Only tags, treat as HTML
+    
+    # If tags take up significant portion, treat as HTML
+    tag_ratio = (len(text) - len(text_without_tags)) / len(text)
+    return tag_ratio > 0.15  # >15% of content is tags
+
+
+# -----------------------
 # High-level pipeline
 # -----------------------
 def preprocess_for_model(
     raw_input: str,
     input_is_html: bool = True,
-    min_para_words: int = 5,
+    min_para_words: int = 3,
     return_sentences: bool = False,
     sentence_split: bool = True,
 ) -> Tuple[str, Optional[List[str]]]:
     """
     Full preprocess pipeline:
-      - if input_is_html: extract main content
+      - if input_is_html: extract main content (with auto-detection)
       - clean html, remove boilerplate
       - normalize whitespace
       - optionally return sentence list
@@ -322,17 +373,55 @@ def preprocess_for_model(
         return "", [] if return_sentences else ("", None)
 
     text = raw_input
+    
+    # Smart HTML detection: auto-adjust if input_is_html=True but content isn't really HTML
+    if input_is_html and not is_likely_full_html(raw_input):
+        logger.info("Input flagged as HTML but appears to be plain text - treating as plain text")
+        input_is_html = False
+    
     if input_is_html:
         try:
             text = extract_text_from_html(raw_input)
+            # Fallback if HTML extraction produced empty/very-short result
+            # Lowered threshold to 5 to catch edge cases like "Hello World"
+            if not text or len(text.strip()) < 5:
+                logger.warning("HTML extraction produced minimal content - using fallback")
+                # Simple tag removal fallback
+                text = re.sub(r"<[^>]+>", " ", raw_input)
+                text = re.sub(r"\s+", " ", text).strip()
+                # Skip paragraph filtering for fallback cases - keep whatever we got
+                text = normalize_whitespace(text)
+                sentences = None
+                if return_sentences or sentence_split:
+                    sentences = split_into_sentences(text) if sentence_split else None
+                if return_sentences:
+                    return text, sentences
+                else:
+                    return text, None
         except Exception as e:
             logger.warning(f"HTML extraction failed: {e}")
             # fallback: remove tags and use visible text
             text = re.sub(r"<[^>]+>", " ", raw_input)
+            text = re.sub(r"\s+", " ", text).strip()
+            # Skip paragraph filtering for fallback cases
+            text = normalize_whitespace(text)
+            sentences = None
+            if return_sentences or sentence_split:
+                sentences = split_into_sentences(text) if sentence_split else None
+            if return_sentences:
+                return text, sentences
+            else:
+                return text, None
 
-    # Normalize and filter paragraphs
+    # Normalize and filter paragraphs (but preserve short content if total is small)
+    original_length = len(text.split())
     text = normalize_whitespace(text)
     text = keep_long_paragraphs(text, min_words=min_para_words)
+    
+    # If filtering removed everything but we had some content, restore it
+    if not text.strip() and original_length > 0:
+        logger.warning(f"Paragraph filtering removed all content (had {original_length} words) - restoring")
+        text = normalize_whitespace(raw_input if not input_is_html else re.sub(r"<[^>]+>", " ", raw_input))
 
     # Further cleaning: remove weird header/footer lines (heuristic)
     # Remove lines that look like navigation or "read more" labels
